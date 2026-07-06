@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
@@ -18,11 +19,22 @@ type Options struct {
 	Retain    bool
 }
 
+// subscription records a topic + handler so it can be (re)applied on every
+// connection, including automatic reconnects.
+type subscription struct {
+	topic   string
+	handler func(topic string, payload []byte)
+}
+
 // Publisher wraps MQTT client lifecycle and topic conventions.
 type Publisher struct {
 	client paho.Client
 	opts   Options
 	logger zerolog.Logger
+
+	mu        sync.Mutex
+	subs      []subscription
+	onConnect func()
 }
 
 func NewPublisher(opts Options, logger zerolog.Logger) *Publisher {
@@ -47,7 +59,14 @@ func (p *Publisher) Connect(ctx context.Context) error {
 		AddBroker(p.opts.BrokerURL).
 		SetClientID(p.opts.ClientID).
 		SetAutoReconnect(true).
-		SetConnectRetry(true)
+		SetConnectRetry(true).
+		// paho defaults to CleanSession=true / ResumeSubs=false, so subscriptions
+		// are NOT restored by the broker on reconnect. Re-apply them ourselves on
+		// every (re)connect so command/test reception resumes after a broker
+		// restart or network blip. This runs for the initial connect too.
+		SetOnConnectHandler(func(_ paho.Client) {
+			p.handleConnect()
+		})
 
 	p.client = paho.NewClient(options)
 	token := p.client.Connect()
@@ -196,13 +215,15 @@ func (p *Publisher) Subscribe(ctx context.Context, topic string, handler func(to
 		return fmt.Errorf("mqtt not connected")
 	}
 
-	token := p.client.Subscribe(topic, p.opts.QoS, func(_ paho.Client, msg paho.Message) {
-		handler(msg.Topic(), msg.Payload())
-	})
-	if !token.WaitTimeout(10 * time.Second) {
-		return fmt.Errorf("mqtt subscribe timeout: %s", topic)
-	}
-	if err := token.Error(); err != nil {
+	sub := subscription{topic: topic, handler: handler}
+
+	// Record the subscription so it is re-applied on every reconnect (see
+	// SetOnConnectHandler in Connect).
+	p.mu.Lock()
+	p.subs = append(p.subs, sub)
+	p.mu.Unlock()
+
+	if err := p.applySubscription(sub); err != nil {
 		return err
 	}
 
@@ -213,6 +234,74 @@ func (p *Publisher) Subscribe(ctx context.Context, topic string, handler func(to
 	}()
 
 	return nil
+}
+
+// AddSubscription records a subscription for replay on every (re)connect without
+// requiring an open connection. Use this when subscriptions must survive an
+// initial connect failure — the OnConnect handler applies them once the client
+// connects (including background retries). Safe to call before Connect.
+func (p *Publisher) AddSubscription(topic string, handler func(topic string, payload []byte)) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.subs = append(p.subs, subscription{topic: topic, handler: handler})
+	p.mu.Unlock()
+}
+
+// SetOnConnect registers a callback invoked after subscriptions are (re)applied
+// on each successful connection. Used to flip readiness state on (re)connect.
+func (p *Publisher) SetOnConnect(cb func()) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.onConnect = cb
+	p.mu.Unlock()
+}
+
+// applySubscription performs the actual broker subscribe for one recorded entry.
+func (p *Publisher) applySubscription(sub subscription) error {
+	token := p.client.Subscribe(sub.topic, p.opts.QoS, func(_ paho.Client, msg paho.Message) {
+		sub.handler(msg.Topic(), msg.Payload())
+	})
+	if !token.WaitTimeout(10 * time.Second) {
+		return fmt.Errorf("mqtt subscribe timeout: %s", sub.topic)
+	}
+	return token.Error()
+}
+
+// handleConnect runs on every successful (re)connect: it replays subscriptions
+// (paho does not restore them under the default CleanSession) and fires the
+// optional readiness callback.
+func (p *Publisher) handleConnect() {
+	p.resubscribe()
+	p.mu.Lock()
+	cb := p.onConnect
+	p.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
+}
+
+// resubscribe replays every recorded subscription. Called from the OnConnect
+// handler so subscriptions survive reconnects (paho does not restore them).
+func (p *Publisher) resubscribe() {
+	if p.client == nil {
+		return
+	}
+	p.mu.Lock()
+	subs := make([]subscription, len(p.subs))
+	copy(subs, p.subs)
+	p.mu.Unlock()
+
+	for _, sub := range subs {
+		if err := p.applySubscription(sub); err != nil {
+			p.logger.Warn().Err(err).Str("topic", sub.topic).Msg("failed to (re)subscribe on connect")
+			continue
+		}
+		p.logger.Debug().Str("topic", sub.topic).Msg("subscription (re)applied on connect")
+	}
 }
 
 func (p *Publisher) Close() {

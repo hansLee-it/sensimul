@@ -71,6 +71,33 @@ func TestRepositoryCRUD(t *testing.T) {
 	}
 }
 
+// TestRepositoryDSNPragmas verifies the DSN pragmas are actually applied by the
+// modernc.org/sqlite driver (mattn-style _foreign_keys/_journal_mode params are
+// silently ignored by it, so this pins the correct _pragma() syntax).
+func TestRepositoryDSNPragmas(t *testing.T) {
+	repo, err := New(filepath.Join(t.TempDir(), "sensimul.db"))
+	if err != nil {
+		t.Fatalf("new repo: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	var foreignKeys int
+	if err := repo.DB().QueryRow("PRAGMA foreign_keys").Scan(&foreignKeys); err != nil {
+		t.Fatalf("query foreign_keys: %v", err)
+	}
+	if foreignKeys != 1 {
+		t.Fatalf("foreign_keys = %d, want 1", foreignKeys)
+	}
+
+	var journalMode string
+	if err := repo.DB().QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		t.Fatalf("query journal_mode: %v", err)
+	}
+	if journalMode != "wal" {
+		t.Fatalf("journal_mode = %q, want wal", journalMode)
+	}
+}
+
 func TestRepositoryRuntimeDurationSetting(t *testing.T) {
 	repo, err := New(filepath.Join(t.TempDir(), "sensimul.db"))
 	if err != nil {

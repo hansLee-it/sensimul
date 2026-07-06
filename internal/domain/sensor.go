@@ -113,6 +113,14 @@ func (s *Sensor) Validate() error {
 	if s.ValueKind != ValueKindFloat && s.ValueKind != ValueKindBool {
 		return fmt.Errorf("invalid value_kind: %s", s.ValueKind)
 	}
+	// Calibration is a multiplier applied to every published value; a zero (or
+	// negative) factor would zero out / invert the sensor output.
+	if s.Calibration <= 0 {
+		return NewValidationError("sensor calibration must be greater than 0")
+	}
+	if s.NoiseSigma < 0 {
+		return NewValidationError("sensor noise_sigma cannot be negative")
+	}
 	return nil
 }
 

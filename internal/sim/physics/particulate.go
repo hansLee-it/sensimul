@@ -25,6 +25,10 @@ type ParticulateEngine struct {
 	// continuously, so we inject a small per-step perturbation. PM10 swings wider
 	// than PM2.5 in absolute terms, scaled by pm10NoiseFactor.
 	NoiseSigma float64
+	// RNG is the noise source. When nil the engine falls back to the global
+	// math/rand source; the simulator injects a per-site seeded *rand.Rand so the
+	// config seed is honored and sites do not share a noise sequence.
+	RNG *rand.Rand
 }
 
 const pm10NoiseFactor = 1.6 // PM10 절대 변동폭이 PM2.5보다 큼
@@ -38,6 +42,13 @@ func NewParticulate(pm25, pm10 float64) *ParticulateEngine {
 		K:           0.05,
 		NoiseSigma:  0.3, // OU 배회 진폭 (실측 사이징: dt=5s·K=0.01에서 PM2.5 std ~2.7)
 	}
+}
+
+func (e *ParticulateEngine) float64() float64 {
+	if e.RNG != nil {
+		return e.RNG.Float64()
+	}
+	return rand.Float64()
 }
 
 // SetAmbient sets the base PM values the engine relaxes toward.
@@ -54,8 +65,8 @@ func (e *ParticulateEngine) SetRate(k float64) {
 }
 
 func (e *ParticulateEngine) Step(dt float64) {
-	noise25 := (rand.Float64() - 0.5) * e.NoiseSigma * 2
-	noise10 := (rand.Float64() - 0.5) * e.NoiseSigma * pm10NoiseFactor * 2
+	noise25 := (e.float64() - 0.5) * e.NoiseSigma * 2
+	noise10 := (e.float64() - 0.5) * e.NoiseSigma * pm10NoiseFactor * 2
 
 	e.PM25 += (-e.K*(e.PM25-e.AmbientPM25))*dt + noise25*dt
 	e.PM10 += (-e.K*(e.PM10-e.AmbientPM10))*dt + noise10*dt

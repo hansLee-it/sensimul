@@ -67,17 +67,19 @@ func New(dbPath string) (*Repository, error) {
 		return nil, fmt.Errorf("failed to create db directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", dbPath+"?_foreign_keys=ON&_journal_mode=WAL")
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open db: %w", err)
 	}
 
 	if err := db.Ping(); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("failed to ping db: %w", err)
 	}
 
 	r := &Repository{db: db}
 	if err := r.initSchema(); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("failed to init schema: %w", err)
 	}
 

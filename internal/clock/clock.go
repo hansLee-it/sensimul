@@ -9,11 +9,13 @@ type Clock interface {
 	Now() time.Time
 	Since(time.Time) time.Duration
 	TickDuration() time.Duration
+	SetTickDuration(time.Duration)
 	Accelerated() bool
 	Advance(time.Duration)
 }
 
 type RealClock struct {
+	mu           sync.Mutex
 	tickInterval time.Duration
 }
 
@@ -30,7 +32,18 @@ func (c *RealClock) Since(t time.Time) time.Duration {
 }
 
 func (c *RealClock) TickDuration() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.tickInterval
+}
+
+// SetTickDuration updates the physics integration dt so a runtime tick-interval
+// change (web UI / runtime setting) keeps the simulated time step in sync with
+// the ticker period.
+func (c *RealClock) SetTickDuration(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tickInterval = d
 }
 
 func (c *RealClock) Accelerated() bool {
@@ -66,7 +79,15 @@ func (c *SimClock) Since(t time.Time) time.Duration {
 }
 
 func (c *SimClock) TickDuration() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.tickInterval
+}
+
+func (c *SimClock) SetTickDuration(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tickInterval = d
 }
 
 func (c *SimClock) Accelerated() bool {

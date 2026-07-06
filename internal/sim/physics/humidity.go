@@ -12,6 +12,10 @@ type HumidityEngine struct {
 	HumidifyingEffect   float64
 	DehumidifyingEffect float64
 	NoiseSigma          float64
+	// RNG is the noise source. When nil the engine falls back to the global
+	// math/rand source; the simulator injects a per-site seeded *rand.Rand so the
+	// config seed is honored and sites do not share a noise sequence.
+	RNG *rand.Rand
 }
 
 func NewHumidity(initial float64) *HumidityEngine {
@@ -21,6 +25,13 @@ func NewHumidity(initial float64) *HumidityEngine {
 		K:          0.05,
 		NoiseSigma: 0.03, // 인위적 노이즈 30%로 축소 (was 0.1)
 	}
+}
+
+func (e *HumidityEngine) float64() float64 {
+	if e.RNG != nil {
+		return e.RNG.Float64()
+	}
+	return rand.Float64()
 }
 
 // SetAmbient updates the outdoor/base humidity the engine relaxes toward.
@@ -38,8 +49,8 @@ func (e *HumidityEngine) SetDehumidifying(power float64) {
 }
 
 func (e *HumidityEngine) Step(dt float64) float64 {
-	ambientVariation := (rand.Float64() - 0.5) * 0.09 // 인위적 변동 30%로 축소 (was 0.3)
-	noise := (rand.Float64() - 0.5) * e.NoiseSigma * 2
+	ambientVariation := (e.float64() - 0.5) * 0.09 // 인위적 변동 30%로 축소 (was 0.3)
+	noise := (e.float64() - 0.5) * e.NoiseSigma * 2
 
 	// Relax toward the base/ambient humidity so the simulated value converges to
 	// the evidence value (KMA RH for outdoor, configured baseline for indoor).

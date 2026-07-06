@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -35,6 +36,7 @@ type Server struct {
 	repo        *sqlite.Repository
 	logger      zerolog.Logger
 	mqttClient  *mqtt.Publisher
+	mqttMu      sync.RWMutex
 	mqttReady   bool
 	hub         *LiveHub
 	httpServer  *http.Server
@@ -42,6 +44,20 @@ type Server struct {
 	manualText  string
 	mqttDocText string
 	staleAfter  time.Duration
+}
+
+// setMqttReady / mqttIsReady guard mqttReady, which is flipped from the paho
+// OnConnect callback goroutine and read by HTTP handler goroutines.
+func (s *Server) setMqttReady(ready bool) {
+	s.mqttMu.Lock()
+	s.mqttReady = ready
+	s.mqttMu.Unlock()
+}
+
+func (s *Server) mqttIsReady() bool {
+	s.mqttMu.RLock()
+	defer s.mqttMu.RUnlock()
+	return s.mqttReady
 }
 
 type viewData struct {
@@ -121,27 +137,18 @@ func (s *Server) setupMQTT() {
 		Retain:    false,
 	}, logging.NewLogger("web-mqtt"))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if err := client.Connect(ctx); err != nil {
-		s.logger.Warn().Err(err).Msg("mqtt not available - live features degraded")
-		s.mqttReady = false
-		return
-	}
-
-	if err := client.Subscribe(context.Background(), mqtt.TopicLiveSensorFilter(), func(topic string, body []byte) {
+	// Register subscriptions up front so they are applied on every (re)connect,
+	// including background retries after an initial connect failure.
+	client.AddSubscription(mqtt.TopicLiveSensorFilter(), func(topic string, body []byte) {
 		parsed, err := payload.FromJSON(body)
 		if err != nil {
 			s.logger.Warn().Err(err).Str("topic", topic).Msg("invalid live payload")
 			return
 		}
 		s.hub.UpsertPayload(parsed)
-	}); err != nil {
-		s.logger.Warn().Err(err).Msg("failed to subscribe live topics")
-	}
+	})
 
-	if err := client.Subscribe(context.Background(), mqtt.TopicTestResultFilter(), func(topic string, body []byte) {
+	client.AddSubscription(mqtt.TopicTestResultFilter(), func(topic string, body []byte) {
 		kind, _, _, ok := mqtt.ParseTestTopic(topic)
 		if !ok || kind != "results" {
 			return
@@ -152,12 +159,27 @@ func (s *Server) setupMQTT() {
 			return
 		}
 		s.hub.PublishTest(result)
-	}); err != nil {
-		s.logger.Warn().Err(err).Msg("failed to subscribe test result topics")
-	}
+	})
 
+	// Flip readiness on each successful (re)connect; the OnConnect handler has
+	// already re-applied the subscriptions by the time this runs.
+	client.SetOnConnect(func() {
+		s.setMqttReady(true)
+		s.logger.Info().Msg("mqtt connected - live features ready")
+	})
+
+	// Always keep the client so its background retry is owned (not leaked) and can
+	// flip readiness once the broker becomes reachable.
 	s.mqttClient = client
-	s.mqttReady = true
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := client.Connect(ctx); err != nil {
+		s.logger.Warn().Err(err).Msg("mqtt not available - live features degraded, retrying in background")
+		s.setMqttReady(false)
+		return
+	}
 }
 
 func (s *Server) Run() error {
@@ -253,9 +275,9 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	case len(parts) == 3 && parts[0] == "events" && parts[1] == "tests" && r.Method == http.MethodGet:
 		s.handleTestEvents(w, r, parts[2])
 	case path == "docs/manual" && r.Method == http.MethodGet:
-		s.render(w, "docs", viewData{Title: "User Manual", Path: path, ManualText: s.manualText, MqttReady: s.mqttReady})
+		s.render(w, "docs", viewData{Title: "User Manual", Path: path, ManualText: s.manualText, MqttReady: s.mqttIsReady()})
 	case path == "docs/mqtt" && r.Method == http.MethodGet:
-		s.render(w, "docs", viewData{Title: "MQTT Manual", Path: path, ManualText: s.mqttDocText, MqttReady: s.mqttReady})
+		s.render(w, "docs", viewData{Title: "MQTT Manual", Path: path, ManualText: s.mqttDocText, MqttReady: s.mqttIsReady()})
 	default:
 		http.NotFound(w, r)
 	}
@@ -267,7 +289,7 @@ func (s *Server) handleSitesPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.render(w, "sites", viewData{Title: "Sites", Path: strings.Trim(r.URL.Path, "/"), Sites: sites, MqttReady: s.mqttReady})
+	s.render(w, "sites", viewData{Title: "Sites", Path: strings.Trim(r.URL.Path, "/"), Sites: sites, MqttReady: s.mqttIsReady()})
 }
 
 func (s *Server) handleSiteCreate(w http.ResponseWriter, r *http.Request) {
@@ -276,17 +298,32 @@ func (s *Server) handleSiteCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lat, _ := strconv.ParseFloat(r.FormValue("latitude"), 64)
-	lon, _ := strconv.ParseFloat(r.FormValue("longitude"), 64)
+	lat, err := strconv.ParseFloat(r.FormValue("latitude"), 64)
+	if err != nil {
+		sites, _ := s.repo.ListSites()
+		s.render(w, "sites", viewData{Title: "Sites", Path: "sites", Sites: sites, Error: "latitude must be a number", MqttReady: s.mqttIsReady()})
+		return
+	}
+	lon, err := strconv.ParseFloat(r.FormValue("longitude"), 64)
+	if err != nil {
+		sites, _ := s.repo.ListSites()
+		s.render(w, "sites", viewData{Title: "Sites", Path: "sites", Sites: sites, Error: "longitude must be a number", MqttReady: s.mqttIsReady()})
+		return
+	}
 	site := domain.NewSite(r.FormValue("id"), r.FormValue("name"), domain.SiteType(r.FormValue("type")), lat, lon)
 	site.Timezone = valueOrDefault(r.FormValue("timezone"), "UTC")
-	elevation, _ := strconv.ParseFloat(r.FormValue("elevation"), 64)
+	elevation, err := strconv.ParseFloat(r.FormValue("elevation"), 64)
+	if err != nil {
+		sites, _ := s.repo.ListSites()
+		s.render(w, "sites", viewData{Title: "Sites", Path: "sites", Sites: sites, Error: "elevation must be a number", MqttReady: s.mqttIsReady()})
+		return
+	}
 	site.Elevation = elevation
 	site.WeatherStation = r.FormValue("weather_station")
 
 	if err := s.repo.CreateSite(site); err != nil {
 		sites, _ := s.repo.ListSites()
-		s.render(w, "sites", viewData{Title: "Sites", Path: "sites", Sites: sites, Error: err.Error(), MqttReady: s.mqttReady})
+		s.render(w, "sites", viewData{Title: "Sites", Path: "sites", Sites: sites, Error: err.Error(), MqttReady: s.mqttIsReady()})
 		return
 	}
 
@@ -299,7 +336,7 @@ func (s *Server) handleSiteEditPage(w http.ResponseWriter, r *http.Request, site
 		http.NotFound(w, r)
 		return
 	}
-	s.render(w, "site-edit", viewData{Title: "Edit Site", Path: "sites", Site: site, MqttReady: s.mqttReady})
+	s.render(w, "site-edit", viewData{Title: "Edit Site", Path: "sites", Site: site, MqttReady: s.mqttIsReady()})
 }
 
 func (s *Server) handleSiteUpdate(w http.ResponseWriter, r *http.Request, siteID string) {
@@ -314,11 +351,24 @@ func (s *Server) handleSiteUpdate(w http.ResponseWriter, r *http.Request, siteID
 		return
 	}
 
-	lat, _ := strconv.ParseFloat(r.FormValue("latitude"), 64)
-	lon, _ := strconv.ParseFloat(r.FormValue("longitude"), 64)
-	elevation, _ := strconv.ParseFloat(r.FormValue("elevation"), 64)
-
 	updated := *current
+
+	lat, err := strconv.ParseFloat(r.FormValue("latitude"), 64)
+	if err != nil {
+		s.render(w, "site-edit", viewData{Title: "Edit Site", Path: "sites", Site: &updated, Error: "latitude must be a number", MqttReady: s.mqttIsReady()})
+		return
+	}
+	lon, err := strconv.ParseFloat(r.FormValue("longitude"), 64)
+	if err != nil {
+		s.render(w, "site-edit", viewData{Title: "Edit Site", Path: "sites", Site: &updated, Error: "longitude must be a number", MqttReady: s.mqttIsReady()})
+		return
+	}
+	elevation, err := strconv.ParseFloat(r.FormValue("elevation"), 64)
+	if err != nil {
+		s.render(w, "site-edit", viewData{Title: "Edit Site", Path: "sites", Site: &updated, Error: "elevation must be a number", MqttReady: s.mqttIsReady()})
+		return
+	}
+
 	updated.Name = r.FormValue("name")
 	updated.Type = domain.SiteType(r.FormValue("type"))
 	updated.Latitude = lat
@@ -330,13 +380,13 @@ func (s *Server) handleSiteUpdate(w http.ResponseWriter, r *http.Request, siteID
 	if current.Type != updated.Type {
 		ctrls, listErr := s.repo.ListControllers(siteID)
 		if listErr == nil && len(ctrls) > 0 {
-			s.render(w, "site-edit", viewData{Title: "Edit Site", Path: "sites", Site: &updated, Error: "site type cannot change while controllers exist", MqttReady: s.mqttReady})
+			s.render(w, "site-edit", viewData{Title: "Edit Site", Path: "sites", Site: &updated, Error: "site type cannot change while controllers exist", MqttReady: s.mqttIsReady()})
 			return
 		}
 	}
 
 	if err := s.repo.UpdateSite(&updated); err != nil {
-		s.render(w, "site-edit", viewData{Title: "Edit Site", Path: "sites", Site: &updated, Error: err.Error(), MqttReady: s.mqttReady})
+		s.render(w, "site-edit", viewData{Title: "Edit Site", Path: "sites", Site: &updated, Error: err.Error(), MqttReady: s.mqttIsReady()})
 		return
 	}
 	http.Redirect(w, r, "/sites", http.StatusSeeOther)
@@ -361,7 +411,7 @@ func (s *Server) handleSensorsPage(w http.ResponseWriter, r *http.Request, siteI
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.render(w, "sensors", viewData{Title: "Sensors", Path: "sites", Site: site, Sensors: sensors, MqttReady: s.mqttReady})
+	s.render(w, "sensors", viewData{Title: "Sensors", Path: "sites", Site: site, Sensors: sensors, MqttReady: s.mqttIsReady()})
 }
 
 func (s *Server) handleSensorCreate(w http.ResponseWriter, r *http.Request, siteID string) {
@@ -384,7 +434,7 @@ func (s *Server) handleSensorCreate(w http.ResponseWriter, r *http.Request, site
 	if err != nil {
 		site, _ := s.repo.GetSite(siteID)
 		sensors, _ := s.repo.ListSensors(siteID)
-		s.render(w, "sensors", viewData{Title: "Sensors", Path: "sites", Site: site, Sensors: sensors, Error: err.Error(), MqttReady: s.mqttReady})
+		s.render(w, "sensors", viewData{Title: "Sensors", Path: "sites", Site: site, Sensors: sensors, Error: err.Error(), MqttReady: s.mqttIsReady()})
 		return
 	}
 	http.Redirect(w, r, fmt.Sprintf("/sites/%s/sensors", siteID), http.StatusSeeOther)
@@ -396,7 +446,7 @@ func (s *Server) handleSensorEditPage(w http.ResponseWriter, r *http.Request, si
 		http.NotFound(w, r)
 		return
 	}
-	s.render(w, "sensor-edit", viewData{Title: "Edit Sensor", Path: "sites", Sensor: sensor, MqttReady: s.mqttReady})
+	s.render(w, "sensor-edit", viewData{Title: "Edit Sensor", Path: "sites", Sensor: sensor, MqttReady: s.mqttIsReady()})
 }
 
 func (s *Server) handleSensorUpdate(w http.ResponseWriter, r *http.Request, siteID, sensorID string) {
@@ -411,8 +461,16 @@ func (s *Server) handleSensorUpdate(w http.ResponseWriter, r *http.Request, site
 		return
 	}
 
-	calibration, _ := strconv.ParseFloat(r.FormValue("calibration"), 64)
-	noise, _ := strconv.ParseFloat(r.FormValue("noise_sigma"), 64)
+	calibration, err := strconv.ParseFloat(r.FormValue("calibration"), 64)
+	if err != nil {
+		s.render(w, "sensor-edit", viewData{Title: "Edit Sensor", Path: "sites", Sensor: sensor, Error: "calibration must be a number", MqttReady: s.mqttIsReady()})
+		return
+	}
+	noise, err := strconv.ParseFloat(r.FormValue("noise_sigma"), 64)
+	if err != nil {
+		s.render(w, "sensor-edit", viewData{Title: "Edit Sensor", Path: "sites", Sensor: sensor, Error: "noise_sigma must be a number", MqttReady: s.mqttIsReady()})
+		return
+	}
 	status := r.FormValue("status")
 
 	sensor.Calibration = calibration
@@ -422,7 +480,7 @@ func (s *Server) handleSensorUpdate(w http.ResponseWriter, r *http.Request, site
 	}
 
 	if err := s.repo.UpdateSensor(sensor); err != nil {
-		s.render(w, "sensor-edit", viewData{Title: "Edit Sensor", Path: "sites", Sensor: sensor, Error: err.Error(), MqttReady: s.mqttReady})
+		s.render(w, "sensor-edit", viewData{Title: "Edit Sensor", Path: "sites", Sensor: sensor, Error: err.Error(), MqttReady: s.mqttIsReady()})
 		return
 	}
 	http.Redirect(w, r, fmt.Sprintf("/sites/%s/sensors", siteID), http.StatusSeeOther)
@@ -447,7 +505,7 @@ func (s *Server) handleControllersPage(w http.ResponseWriter, r *http.Request, s
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.render(w, "controllers", viewData{Title: "Controllers", Path: "sites", Site: site, Controllers: controllers, MqttReady: s.mqttReady})
+	s.render(w, "controllers", viewData{Title: "Controllers", Path: "sites", Site: site, Controllers: controllers, MqttReady: s.mqttIsReady()})
 }
 
 func (s *Server) handleControllerCreate(w http.ResponseWriter, r *http.Request, siteID string) {
@@ -469,7 +527,7 @@ func (s *Server) handleControllerCreate(w http.ResponseWriter, r *http.Request, 
 
 	if err != nil {
 		controllers, _ := s.repo.ListControllers(siteID)
-		s.render(w, "controllers", viewData{Title: "Controllers", Path: "sites", Site: site, Controllers: controllers, Error: err.Error(), MqttReady: s.mqttReady})
+		s.render(w, "controllers", viewData{Title: "Controllers", Path: "sites", Site: site, Controllers: controllers, Error: err.Error(), MqttReady: s.mqttIsReady()})
 		return
 	}
 	http.Redirect(w, r, fmt.Sprintf("/sites/%s/controllers", siteID), http.StatusSeeOther)
@@ -481,7 +539,7 @@ func (s *Server) handleControllerEditPage(w http.ResponseWriter, r *http.Request
 		http.NotFound(w, r)
 		return
 	}
-	s.render(w, "controller-edit", viewData{Title: "Edit Controller", Path: "sites", Controller: ctrl, MqttReady: s.mqttReady})
+	s.render(w, "controller-edit", viewData{Title: "Edit Controller", Path: "sites", Controller: ctrl, MqttReady: s.mqttIsReady()})
 }
 
 func (s *Server) handleControllerUpdate(w http.ResponseWriter, r *http.Request, siteID, controllerID string) {
@@ -507,7 +565,7 @@ func (s *Server) handleControllerUpdate(w http.ResponseWriter, r *http.Request, 
 	if raw := strings.TrimSpace(r.FormValue("target_value")); raw != "" {
 		target, err := strconv.ParseFloat(raw, 64)
 		if err != nil {
-			s.render(w, "controller-edit", viewData{Title: "Edit Controller", Path: "sites", Controller: ctrl, Error: "target must be a number", MqttReady: s.mqttReady})
+			s.render(w, "controller-edit", viewData{Title: "Edit Controller", Path: "sites", Controller: ctrl, Error: "target must be a number", MqttReady: s.mqttIsReady()})
 			return
 		}
 		ctrl.TargetValue = target
@@ -523,7 +581,7 @@ func (s *Server) handleControllerUpdate(w http.ResponseWriter, r *http.Request, 
 	}
 
 	if err := s.repo.UpdateController(ctrl); err != nil {
-		s.render(w, "controller-edit", viewData{Title: "Edit Controller", Path: "sites", Controller: ctrl, Error: err.Error(), MqttReady: s.mqttReady})
+		s.render(w, "controller-edit", viewData{Title: "Edit Controller", Path: "sites", Controller: ctrl, Error: err.Error(), MqttReady: s.mqttIsReady()})
 		return
 	}
 	http.Redirect(w, r, fmt.Sprintf("/sites/%s/controllers", siteID), http.StatusSeeOther)
@@ -543,7 +601,7 @@ func (s *Server) handleLivePage(w http.ResponseWriter, r *http.Request) {
 
 	interval, err := s.runtimeTickInterval()
 	if err != nil {
-		s.render(w, "live", viewData{Title: "Live Sensors", Path: strings.Trim(r.URL.Path, "/"), Live: markStale(readings, s.staleAfter), StaleAfter: s.staleAfter, Error: err.Error(), MqttReady: s.mqttReady})
+		s.render(w, "live", viewData{Title: "Live Sensors", Path: strings.Trim(r.URL.Path, "/"), Live: markStale(readings, s.staleAfter), StaleAfter: s.staleAfter, Error: err.Error(), MqttReady: s.mqttIsReady()})
 		return
 	}
 
@@ -552,7 +610,7 @@ func (s *Server) handleLivePage(w http.ResponseWriter, r *http.Request) {
 		success = "Tick / publish interval updated"
 	}
 
-	s.render(w, "live", viewData{Title: "Live Sensors", Path: strings.Trim(r.URL.Path, "/"), Live: markStale(readings, s.staleAfter), StaleAfter: s.staleAfter, RuntimeTickInterval: interval.String(), Success: success, MqttReady: s.mqttReady})
+	s.render(w, "live", viewData{Title: "Live Sensors", Path: strings.Trim(r.URL.Path, "/"), Live: markStale(readings, s.staleAfter), StaleAfter: s.staleAfter, RuntimeTickInterval: interval.String(), Success: success, MqttReady: s.mqttIsReady()})
 }
 
 func (s *Server) handleTickIntervalUpdate(w http.ResponseWriter, r *http.Request) {
@@ -565,14 +623,14 @@ func (s *Server) handleTickIntervalUpdate(w http.ResponseWriter, r *http.Request
 	if err != nil || interval <= 0 {
 		readings := s.hub.Readings()
 		sort.Slice(readings, func(i, j int) bool { return readings[i].SensorID < readings[j].SensorID })
-		s.render(w, "live", viewData{Title: "Live Sensors", Path: "live", Live: markStale(readings, s.staleAfter), StaleAfter: s.staleAfter, RuntimeTickInterval: r.FormValue("tick_interval"), Error: "tick interval must be a positive duration such as 500ms, 1s, or 5s", MqttReady: s.mqttReady})
+		s.render(w, "live", viewData{Title: "Live Sensors", Path: "live", Live: markStale(readings, s.staleAfter), StaleAfter: s.staleAfter, RuntimeTickInterval: r.FormValue("tick_interval"), Error: "tick interval must be a positive duration such as 500ms, 1s, or 5s", MqttReady: s.mqttIsReady()})
 		return
 	}
 
 	if err := s.repo.SetRuntimeDuration(sqlite.RuntimeSettingTickInterval, interval); err != nil {
 		readings := s.hub.Readings()
 		sort.Slice(readings, func(i, j int) bool { return readings[i].SensorID < readings[j].SensorID })
-		s.render(w, "live", viewData{Title: "Live Sensors", Path: "live", Live: markStale(readings, s.staleAfter), StaleAfter: s.staleAfter, RuntimeTickInterval: interval.String(), Error: err.Error(), MqttReady: s.mqttReady})
+		s.render(w, "live", viewData{Title: "Live Sensors", Path: "live", Live: markStale(readings, s.staleAfter), StaleAfter: s.staleAfter, RuntimeTickInterval: interval.String(), Error: err.Error(), MqttReady: s.mqttIsReady()})
 		return
 	}
 
@@ -614,7 +672,7 @@ func (s *Server) handleLiveSensorPage(w http.ResponseWriter, r *http.Request, se
 	}
 	staled := markStale([]SensorLiveReading{reading}, s.staleAfter)
 	one := staled[0]
-	s.render(w, "live-sensor", viewData{Title: "Sensor Live", Path: "live", Sensor: sensor, LiveOne: &one, StaleAfter: s.staleAfter, MqttReady: s.mqttReady})
+	s.render(w, "live-sensor", viewData{Title: "Sensor Live", Path: "live", Sensor: sensor, LiveOne: &one, StaleAfter: s.staleAfter, MqttReady: s.mqttIsReady()})
 }
 
 func (s *Server) handleSensorTest(w http.ResponseWriter, r *http.Request, sensorID string) {
@@ -623,7 +681,7 @@ func (s *Server) handleSensorTest(w http.ResponseWriter, r *http.Request, sensor
 		http.NotFound(w, r)
 		return
 	}
-	if s.mqttClient == nil || !s.mqttReady {
+	if s.mqttClient == nil || !s.mqttIsReady() {
 		http.Error(w, "mqtt unavailable", http.StatusServiceUnavailable)
 		return
 	}

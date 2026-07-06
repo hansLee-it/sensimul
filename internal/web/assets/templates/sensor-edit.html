@@ -10,8 +10,8 @@
       <option value="offline" {{if eq .Sensor.Status "offline"}}selected{{end}}>offline</option>
       <option value="faulted" {{if eq .Sensor.Status "faulted"}}selected{{end}}>faulted</option>
     </select>
-    <input name="calibration" value="{{.Sensor.Calibration}}" />
-    <input name="noise_sigma" value="{{.Sensor.NoiseSigma}}" />
+    <input name="calibration" type="number" step="any" min="0" required value="{{.Sensor.Calibration}}" />
+    <input name="noise_sigma" type="number" step="any" min="0" required value="{{.Sensor.NoiseSigma}}" />
     <button type="submit">Save</button>
   </form>
   <p><a href="/sites/{{.Sensor.SiteID}}/sensors">← back</a></p>
