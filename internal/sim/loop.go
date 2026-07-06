@@ -106,6 +106,9 @@ func (l *Loop) Start(ctx context.Context) error {
 		return err
 	}
 	l.cfg.TickInterval = tickInterval
+	if l.clock != nil {
+		l.clock.SetTickDuration(tickInterval)
+	}
 
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
@@ -167,6 +170,12 @@ func (l *Loop) reloadRuntimeTickInterval(ticker *time.Ticker) error {
 	ticker.Reset(interval)
 	old := l.cfg.TickInterval
 	l.cfg.TickInterval = interval
+	if l.clock != nil {
+		// Keep the physics integration dt (tickSeconds → clock.TickDuration) in
+		// sync with the new ticker period; otherwise a 5s→500ms change would run
+		// the physics 10x fast.
+		l.clock.SetTickDuration(interval)
+	}
 	l.logger.Info().Dur("old_tick_interval", old).Dur("tick_interval", interval).Msg("runtime tick interval updated")
 	return nil
 }

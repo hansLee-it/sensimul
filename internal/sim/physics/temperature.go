@@ -12,6 +12,10 @@ type TemperatureEngine struct {
 	CoolingEffect float64
 	HeatingEffect float64
 	NoiseSigma    float64
+	// RNG is the noise source. When nil the engine falls back to the global
+	// math/rand source; the simulator injects a per-site seeded *rand.Rand so the
+	// config seed is honored and sites do not share a noise sequence.
+	RNG *rand.Rand
 }
 
 func NewTemperature(initial, ambient float64) *TemperatureEngine {
@@ -21,6 +25,13 @@ func NewTemperature(initial, ambient float64) *TemperatureEngine {
 		K:          0.1,
 		NoiseSigma: 0.015, // 인위적 노이즈 30%로 축소 (was 0.05)
 	}
+}
+
+func (e *TemperatureEngine) float64() float64 {
+	if e.RNG != nil {
+		return e.RNG.Float64()
+	}
+	return rand.Float64()
 }
 
 // SetAmbient updates the outdoor/base temperature the engine relaxes toward.
@@ -40,8 +51,8 @@ func (e *TemperatureEngine) SetHeating(power float64) {
 func (e *TemperatureEngine) Step(dt float64) float64 {
 	cooling := e.CoolingEffect
 	heating := e.HeatingEffect
-	ambientVariation := (rand.Float64() - 0.5) * 0.06 // 인위적 변동 30%로 축소 (was 0.2)
-	noise := (rand.Float64() - 0.5) * e.NoiseSigma * 2
+	ambientVariation := (e.float64() - 0.5) * 0.06 // 인위적 변동 30%로 축소 (was 0.2)
+	noise := (e.float64() - 0.5) * e.NoiseSigma * 2
 
 	e.Current += (-e.K*(e.Current-(e.Ambient+ambientVariation)) + cooling + heating) * dt
 	e.Current += noise * dt

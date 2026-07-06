@@ -1,6 +1,9 @@
 package sim
 
 import (
+	"hash/fnv"
+	"math/rand"
+
 	"github.com/sensimul/sensimul/internal/domain"
 	"github.com/sensimul/sensimul/internal/sim/physics"
 )
@@ -38,15 +41,25 @@ type WeatherSnapshot struct {
 }
 
 func NewState(site *domain.Site, seed int64) *State {
-	rng := NewRand(seed)
+	// Derive a per-site seed so the config seed is honored and different sites do
+	// not share an identical noise sequence.
+	siteSeed := deriveSeed(seed, site.ID)
+	rng := NewRand(siteSeed)
+
+	tempEngine := physics.NewTemperature(site.Env.TemperatureC, site.Env.TemperatureC)
+	tempEngine.RNG = rand.New(rand.NewSource(siteSeed + 1))
+	humidityEngine := physics.NewHumidity(site.Env.HumidityPct)
+	humidityEngine.RNG = rand.New(rand.NewSource(siteSeed + 2))
+	particulateEngine := physics.NewParticulate(site.Env.PM25UgM3, site.Env.PM10UgM3)
+	particulateEngine.RNG = rand.New(rand.NewSource(siteSeed + 3))
 
 	s := &State{
 		Site:           site,
 		Sensors:        make([]*domain.Sensor, 0),
 		Controllers:    make([]*domain.Controller, 0),
-		TempEngine:     physics.NewTemperature(site.Env.TemperatureC, site.Env.TemperatureC),
-		HumidityEngine: physics.NewHumidity(site.Env.HumidityPct),
-		Particulate:    physics.NewParticulate(site.Env.PM25UgM3, site.Env.PM10UgM3),
+		TempEngine:     tempEngine,
+		HumidityEngine: humidityEngine,
+		Particulate:    particulateEngine,
 		RNG:            rng,
 		BaselinePM25:   site.Env.PM25UgM3,
 		BaselinePM10:   site.Env.PM10UgM3,
@@ -54,6 +67,14 @@ func NewState(site *domain.Site, seed int64) *State {
 		Frozen:         false,
 	}
 	return s
+}
+
+// deriveSeed folds the site ID into the base seed so each site gets a distinct
+// but reproducible RNG sequence.
+func deriveSeed(seed int64, siteID string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(siteID))
+	return seed ^ int64(h.Sum64())
 }
 
 func (s *State) AddSensor(sensor *domain.Sensor) {
